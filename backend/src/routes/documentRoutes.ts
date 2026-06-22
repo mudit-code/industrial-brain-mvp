@@ -3,9 +3,11 @@ import multer from 'multer';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
-import PDFParser from 'pdf2json';
+import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import { saveDocument, getDocuments } from '../data/repository.js';
 import { fileURLToPath } from 'url';
+import { embedText, addChunksToVectorDB } from '../data/vectorStore.js';
+import type { DocumentChunk } from '../data/vectorStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,20 +32,81 @@ router.get('/', (req, res) => {
   res.json(safeDocs);
 });
 
-function extractTextFromPDF(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const pdfParser = new (PDFParser as any)(null, 1);
-    
-    pdfParser.on("pdfParser_dataError", (errData: any) => {
-      reject(errData.parserError);
-    });
-    
-    pdfParser.on("pdfParser_dataReady", () => {
-      resolve(pdfParser.getRawTextContent());
-    });
-    
-    pdfParser.loadPDF(filePath);
+function render_page(pageData: any) {
+  let render_options = {
+      normalizeWhitespace: false,
+      disableCombineTextItems: false
+  }
+
+  return pageData.getTextContent(render_options)
+  .then(function(textContent: any) {
+      let lastY, text = '';
+      for (let item of textContent.items) {
+          if (lastY == item.transform[5] || !lastY){
+              text += item.str;
+          } else {
+              text += '\n' + item.str;
+          }
+          lastY = item.transform[5];
+      }
+      return `\n--- PAGE ${pageData.pageIndex + 1} ---\n${text}\n`;
   });
+}
+
+async function extractTextFromPDF(filePath: string): Promise<string> {
+  const dataBuffer = fs.readFileSync(filePath);
+  const data = await pdfParse(dataBuffer, { pagerender: render_page });
+  return data.text;
+}
+
+function chunkTextWithPages(text: string, originalName: string): Omit<DocumentChunk, 'vector'>[] {
+  const chunks: Omit<DocumentChunk, 'vector'>[] = [];
+  const parts = text.split(/(?=--- PAGE \d+ ---)/);
+  
+  let chunkIndex = 0;
+  for (const part of parts) {
+    if (part.trim().length === 0) continue;
+    
+    // Extract page number
+    const pageMatch = part.match(/--- PAGE (\d+) ---/);
+    const pageNumber = pageMatch && pageMatch[1] ? parseInt(pageMatch[1], 10) : 1;
+    
+    // Clean text
+    const cleanText = part.replace(/--- PAGE \d+ ---/, '').trim();
+    if (cleanText.length === 0) continue;
+    
+    // Split into ~500 word chunks with 50 word overlap
+    const words = cleanText.split(/\s+/);
+    let currentChunkWords: string[] = [];
+    
+    for (const word of words) {
+      currentChunkWords.push(word);
+      if (currentChunkWords.length >= 500) {
+        chunks.push({
+          text: currentChunkWords.join(' '),
+          originalName,
+          chunkIndex: chunkIndex++,
+          pageNumber,
+          totalChunks: 0 // placeholder
+        });
+        currentChunkWords = currentChunkWords.slice(-50);
+      }
+    }
+    
+    if (currentChunkWords.length > 50 || (chunks.length === 0 && currentChunkWords.length > 0)) {
+       chunks.push({
+          text: currentChunkWords.join(' '),
+          originalName,
+          chunkIndex: chunkIndex++,
+          pageNumber,
+          totalChunks: 0 // placeholder
+        });
+    }
+  }
+  
+  // Set correct totalChunks
+  const total = chunks.length;
+  return chunks.map(c => ({ ...c, totalChunks: total }));
 }
 
 router.post('/upload', upload.single('file'), async (req, res) => {
@@ -63,6 +126,22 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         if (text && text.trim().length > 0) {
           extractedText = text;
           console.log(`Successfully extracted ${text.length} characters from ${req.file.originalname}`);
+          
+          console.log('Chunking document...');
+          const docChunks = chunkTextWithPages(extractedText, req.file.originalname);
+          console.log(`Created ${docChunks.length} chunks. Generating embeddings...`);
+          
+          const finalChunks: DocumentChunk[] = [];
+          for (const chunk of docChunks) {
+              const vector = await embedText(chunk.text);
+              finalChunks.push({
+                  ...chunk,
+                  vector
+              });
+          }
+          
+          console.log(`Embeddings generated. Inserting into LanceDB...`);
+          await addChunksToVectorDB(finalChunks);
         } else {
           console.warn(`Extracted text from ${req.file.originalname} was empty. Using simulated content.`);
         }
